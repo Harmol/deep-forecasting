@@ -71,6 +71,14 @@ def print_loss_metrics(
     return None
 
 
+# calculate accuracy
+def binary_acc(y_true, y_pred):
+    preds = torch.round(torch.sigmoid(y_pred))
+    correct = torch.eq(y_pred, y_true).float()
+    acc = correct.sum() / len(correct)
+    return acc    
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--sequence-length", type=int, default=params['sequence_length'])

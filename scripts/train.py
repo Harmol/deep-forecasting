@@ -3,11 +3,13 @@
 
 import yaml
 import argparse
+import math
 import numpy as np
 import pandas as pd
 from pathlib import Path
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import preprocess
 
@@ -19,20 +21,21 @@ model_dir = params['model_dir']
 
 
 class TimeSeriesDataset(Dataset):   
-    def __init__(self, X, y, seq_len=1):
+    def __init__(self, X, y, seq_len=1, step=1):
         self.X = X
         self.y = y
         self.seq_len = seq_len
+        self.step = step
 
     def __len__(self):
-        return self.X.__len__() - self.seq_len
+        return self.X.__len__() - self.seq_len - self.step
 
     def __getitem__(self, index):
-        return self.X[index:index+self.seq_len], self.y[index+self.seq_len]
+        return self.X[index:index+self.seq_len], self.y[index+self.seq_len+self.step-1]
 
 
 class TSModel(nn.Module):
-    def __init__(self, n_features, n_hidden=64, n_layers=2):
+    def __init__(self, n_features, n_hidden=64, n_layers=1):
         super(TSModel, self).__init__()
 
         self.n_hidden = n_hidden
@@ -44,12 +47,24 @@ class TSModel(nn.Module):
             dropout=0.5
         )
         self.linear = nn.Linear(n_hidden, 1)
+        self.dropout = nn.Dropout(0.5)
         
+    # lstm_output: (batch_size, seq_len, n_hidden)
+    # final_state: (1, batch_size, n_hidden)    
+    def attention(self, lstm_output, final_state):
+        final_state = final_state.permute(1, 2, 0) # (1,b,h)->(b,h,1)
+        weights = torch.bmm(lstm_output, final_state)  # (b,s,1)
+        weights = F.softmax(weights, dim=1)
+
+        return torch.bmm(lstm_output.permute(0, 2, 1), weights).squeeze(2) # (b,h)
+
     def forward(self, x):
-        _, (hidden, _) = self.lstm(x)
-        lstm_out = hidden[-1]  # output last hidden state output
-        y_pred = self.linear(lstm_out)
-        
+        # final_hidden_state, final_cell_state : [num_layers(=1) * num_directions(=2), batch_size, n_hidden * num_directions]
+        # output : [batch_size, seq_len, n_hidden * num_directions]
+        output, (hn, cn) = self.lstm(x)
+
+        attn_output = self.attention(output, hn)
+        y_pred = self.linear(attn_output)
         return y_pred
     
 
@@ -58,6 +73,7 @@ def train_model(
         test_df,
         label_name,
         sequence_length,
+        step,
         batch_size,
         n_epochs,
         n_epochs_stop
@@ -66,10 +82,10 @@ def train_model(
     print("Starting with model training...")
 
     # create dataloaders
-    train_dataset = TimeSeriesDataset(np.array(train_df), np.array(train_df[label_name]), seq_len=sequence_length)
+    train_dataset = TimeSeriesDataset(np.array(train_df), np.array(train_df[label_name]), seq_len=sequence_length, step=step)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
 
-    test_dataset = TimeSeriesDataset(np.array(test_df), np.array(test_df[label_name]), seq_len=sequence_length)
+    test_dataset = TimeSeriesDataset(np.array(test_df), np.array(test_df[label_name]), seq_len=sequence_length, step=step)
     test_loader = DataLoader(test_dataset, batch_size=100, shuffle=False)
 
     # set up training
@@ -77,6 +93,12 @@ def train_model(
     model = TSModel(n_features)
     criterion = torch.nn.MSELoss()  # L1Loss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+    # export model for visualization
+    # input_names = ['Sentence']
+    # output_names = ['yhat']
+    # dummy_input = torch.randn(1, 1, n_features)
+    # torch.onnx.export(model, dummy_input, '../model/rnn.onnx', input_names=input_names, output_names=output_names)
 
     train_hist = []
     test_hist = []
@@ -142,6 +164,7 @@ def train_model(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--sequence-length", type=int, default=params['sequence_length'])
+    parser.add_argument("--step", type=int, default=params['step'])
     parser.add_argument("--batch-size", type=int, default=params['batch_size'])
     parser.add_argument("--n-epochs", type=int, default=params['n_epochs'])
     parser.add_argument("--n-epochs-stop", type=int, default=params['n_epochs_stop'])
@@ -156,6 +179,7 @@ if __name__ == "__main__":
         test_df,
         label_name,
         args.sequence_length,
+        args.step,
         args.batch_size,
         args.n_epochs,
         args.n_epochs_stop
